@@ -27,6 +27,7 @@ from ..mean_functions import Zero
 
 from .model import GPModel
 
+
 class SGPRUpperMixin(object):
     """
     Upper bound for the GP regression marginal likelihood.
@@ -62,7 +63,8 @@ class SGPRUpperMixin(object):
         Kuf = self.feature.Kuf(self.kern, self.X)
 
         L = tf.cholesky(Kuu)
-        LB = tf.cholesky(Kuu + self.likelihood.variance ** -1.0 * tf.matmul(Kuf, Kuf, transpose_b=True))
+        LB = tf.cholesky(
+            Kuu + self.likelihood.variance ** -1.0 * tf.matmul(Kuf, Kuf, transpose_b=True))
 
         LinvKuf = tf.matrix_triangular_solve(L, Kuf, lower=True)
         # Using the Trace bound, from Titsias' presentation
@@ -78,8 +80,10 @@ class SGPRUpperMixin(object):
         logdet = tf.reduce_sum(tf.log(tf.diag_part(L))) - tf.reduce_sum(tf.log(tf.diag_part(LB)))
 
         LC = tf.cholesky(Kuu + corrected_noise ** -1.0 * tf.matmul(Kuf, Kuf, transpose_b=True))
-        v = tf.matrix_triangular_solve(LC, corrected_noise ** -1.0 * tf.matmul(Kuf, self.Y), lower=True)
-        quad = -0.5 * corrected_noise ** -1.0 * tf.reduce_sum(self.Y ** 2.0) + 0.5 * tf.reduce_sum(v ** 2.0)
+        v = tf.matrix_triangular_solve(LC, corrected_noise ** -1.0 * tf.matmul(Kuf, self.Y),
+                                       lower=True)
+        quad = -0.5 * corrected_noise ** -1.0 * tf.reduce_sum(self.Y ** 2.0) + 0.5 * tf.reduce_sum(
+            v ** 2.0)
 
         return const + logdet + quad
 
@@ -104,7 +108,8 @@ class SGPR(GPModel, SGPRUpperMixin):
 
     """
 
-    def __init__(self, X, Y, kern, feat=None, mean_function=None, Z=None, **kwargs):
+    def __init__(self, X, Y, kern, feat=None, mean_function=None, Z=None, update_cache=False,
+                 **kwargs):
         """
         X is a data matrix, size N x D
         Y is a data matrix, size N x R
@@ -119,6 +124,9 @@ class SGPR(GPModel, SGPRUpperMixin):
         GPModel.__init__(self, X, Y, kern, likelihood, mean_function, **kwargs)
         self.feature = features.inducingpoint_wrapper(feat, Z)
         self.num_data = X.shape[0]
+        self.cache_updated=False
+        if update_cache:
+            self.update_cache()
 
     @params_as_tensors
     def _build_likelihood(self):
@@ -189,6 +197,60 @@ class SGPR(GPModel, SGPRUpperMixin):
                   - tf.reduce_sum(tf.square(tmp1), 0)
             var = tf.tile(var[:, None], [1, self.num_latent])
         return mean + self.mean_function(Xnew), var
+
+    @params_as_tensors
+    def _build_predict_fast(self, Xnew, pre_mean, pre_var):
+        """
+        Compute the mean and variance of the latent function at some new points
+        Xnew. For a derivation of the terms in here, see the associated SGPR
+        notebook.
+        """
+
+        Kus = self.feature.Kuf(self.kern, Xnew)
+        mean = tf.matmul(Kus, pre_mean, transpose_a=True)
+        var = self.kern.K(Xnew) + tf.matmul(Kus, tf.matmul(pre_var, Kus), transpose_a=True)
+        return mean, var
+
+    @params_as_tensors
+    def _build_cache(self):
+        num_inducing = len(self.feature)
+        err = self.Y - self.mean_function(self.X)
+        Kuu = self.feature.Kuu(self.kern, jitter=settings.numerics.jitter_level)
+        Kuf = self.feature.Kuf(self.kern, self.X)
+        sigma = tf.sqrt(self.likelihood.variance)
+        L = tf.cholesky(Kuu)
+        A = tf.matrix_triangular_solve(L, Kuf, lower=True) / sigma
+        B = tf.matmul(A, A, transpose_b=True) + tf.eye(num_inducing, dtype=settings.float_type)
+        LB = tf.cholesky(B)
+        Aerr = tf.matmul(A, err)
+        c = tf.matrix_triangular_solve(LB, Aerr, lower=True) / sigma
+
+        tmp1 = tf.matrix_triangular_solve(L, tf.eye(num_inducing, dtype=settings.float_type),
+                                          lower=True)
+        tmp2 = tf.matrix_triangular_solve(LB, tmp1, lower=True)
+        pre_mean = tf.matmul(tmp2, c, transpose_a=True)
+        pre_var = tf.matmul(tmp2, tmp2, transpose_a=True) - tf.matmul(tmp1, tmp1, transpose_a=True)
+        return pre_mean, pre_var
+
+    @autoflow()
+    def _get_cache(self):
+        return self._build_cache()
+
+    def update_cache(self):
+        self.cache_updated = True
+        self.cache = self._get_cache()
+
+    @autoflow((settings.float_type, [None, None]),
+              (settings.float_type, [None, None]),
+              (settings.float_type, [None, None]))
+    def _predict_fast(self, Xnew, pre_mean, pre_var):
+        return self._build_predict_fast(Xnew, pre_mean, pre_var)
+
+    def predict_fast(self, Xnew):
+        if not self.cache_updated:
+            raise ValueError("cache must be updated. Call udpate_cache before calling this "
+                             "function.")
+        return self._predict_fast(Xnew, *self.cache)
 
 
 class GPRFITC(GPModel, SGPRUpperMixin):
@@ -290,7 +352,8 @@ class GPRFITC(GPModel, SGPRUpperMixin):
         #                    = \log [ \det \diag( \nu ) ] + \log [ \det( I + V \diag( \nu^{-1} ) V^T ) ]
 
         constantTerm = -0.5 * self.num_data * tf.log(tf.constant(2. * np.pi, settings.float_type))
-        logDeterminantTerm = -0.5 * tf.reduce_sum(tf.log(nu)) - tf.reduce_sum(tf.log(tf.matrix_diag_part(L)))
+        logDeterminantTerm = -0.5 * tf.reduce_sum(tf.log(nu)) - tf.reduce_sum(
+            tf.log(tf.matrix_diag_part(L)))
         logNormalizingTerm = constantTerm + logDeterminantTerm
 
         return mahalanobisTerm + logNormalizingTerm * self.num_latent
