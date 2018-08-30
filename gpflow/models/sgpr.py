@@ -124,6 +124,8 @@ class SGPR(GPModel, SGPRUpperMixin):
         GPModel.__init__(self, X, Y, kern, likelihood, mean_function, **kwargs)
         self.feature = features.inducingpoint_wrapper(feat, Z)
         self.num_data = X.shape[0]
+        self.x_dim = X.shape[1]
+        self.y_dim = Y.shape[1]
         self.cache_updated=False
         if update_cache:
             self.update_cache()
@@ -211,6 +213,26 @@ class SGPR(GPModel, SGPRUpperMixin):
         var = self.kern.K(Xnew) + tf.matmul(Kus, tf.matmul(pre_var, Kus), transpose_a=True)
         return mean, var
 
+    @autoflow((settings.float_type, [None, None]),
+              (tf.int32, []),
+              (settings.float_type, [None, None]),
+              (settings.float_type, [None, None]))
+    def _predict_f_samples_fast(self, Xnew, num_samples, pre_mean, pre_var):
+        """
+        Produce samples from the posterior latent function(s) at the points
+        Xnew.
+        """
+        mu, var = self._build_predict_fast(Xnew, pre_mean, pre_var)
+        jitter = tf.eye(tf.shape(mu)[0], dtype=settings.float_type) * settings.numerics.jitter_level
+        samples = []
+        L = tf.squeeze(tf.sqrt(var + jitter))
+        V = tf.random_normal([num_samples], dtype=settings.float_type)
+        samples.append(tf.squeeze(mu) + L * V)
+        return tf.squeeze(tf.stack(samples))
+
+    def predict_f_samples_fast(self, Xnew, num_samples):
+        return self._predict_f_samples_fast(Xnew, num_samples, *self.cache)
+
     @params_as_tensors
     def _build_cache(self):
         num_inducing = len(self.feature)
@@ -251,6 +273,88 @@ class SGPR(GPModel, SGPRUpperMixin):
             raise ValueError("cache must be updated. Call udpate_cache before calling this "
                              "function.")
         return self._predict_fast(Xnew, *self.cache)
+
+    def _det(self, mat):
+        return tf.square(tf.reduce_prod(tf.diag_part(tf.cholesky(mat))))
+
+    def _inv_det(self, mat, n):
+        L = tf.cholesky(mat)
+        L_inv = tf.matrix_triangular_solve(L, tf.eye(n, dtype=settings.float_type))
+        inv = tf.matmul(L_inv, L_inv, transpose_a=True)
+        det = tf.square(tf.reduce_prod(tf.diag_part(L)))
+        return inv, det
+
+    def _build_betas_K_inv(self):
+        num_inducing = len(self.feature)
+
+        Kuf = self.feature.Kuf(self.kern, self.X)
+        Kuu = self.feature.Kuu(self.kern, jitter=settings.numerics.jitter_level)
+        sigma = tf.sqrt(self.likelihood.variance)
+        L = tf.cholesky(Kuu)
+        A = tf.matrix_triangular_solve(L, Kuf, lower=True) / sigma
+        B = tf.matmul(A, A, transpose_b=True) + tf.eye(num_inducing, dtype=settings.float_type)
+        LB = tf.cholesky(B)
+        Ay = tf.matmul(A, self.Y)
+        c = tf.matrix_triangular_solve(LB, Ay, lower=True) / sigma
+        tmp1 = tf.matrix_triangular_solve(
+            L, tf.eye(num_inducing, dtype=settings.float_type), lower=True)
+        tmp2 = tf.matrix_triangular_solve(LB, tmp1, lower=True)
+        betas = tf.matmul(tmp2, c, transpose_a=True)
+        K_inv = tf.matmul(tmp1, tmp1, transpose_a=True) - tf.matmul(tmp2, tmp2, transpose_a=True)
+        return betas, K_inv
+
+    def _build_q(self, sigma_new, nu, Lambda, Lambda_inv):
+        norm = tf.sqrt(self._det(tf.matmul(sigma_new, Lambda_inv)
+                                 + tf.eye(self.x_dim, dtype=settings.float_type)))
+        L_sigma = tf.cholesky(sigma_new + Lambda)
+        t1 = tf.matrix_triangular_solve(L_sigma, tf.transpose(nu))
+        t2 = tf.matrix_triangular_solve(tf.transpose(L_sigma), t1, lower=False)
+        r = tf.reduce_sum(tf.multiply(nu, tf.transpose(t2)), axis=1)
+        return self.kern.variance / norm * tf.exp(-0.5 * r)
+
+    @params_as_tensors
+    def _build_moment_matching(self, mu_new, sigma_new):
+        num_inducing = len(self.feature)
+
+        betas, K_inv = self._build_betas_K_inv()
+
+        square_lengthscales = tf.square(self.kern.lengthscales)
+        Lambda = tf.diag(square_lengthscales)
+        Lambda_inv = tf.diag(1 / square_lengthscales)
+        nu = self.feature.Z - mu_new
+
+        q = self._build_q(sigma_new, nu, Lambda, Lambda_inv)
+
+        means = tf.tensordot(q, betas, 1)
+
+        # k = self.feature.Kuf(self.kern, tf.expand_dims(mu_new, axis=0))[:, 0]
+
+        R = tf.matmul(sigma_new, Lambda_inv + Lambda_inv) \
+            + tf.eye(self.x_dim, dtype=settings.float_type)
+        R_inv, _ = self._inv_det(R, self.x_dim)
+        R_sigma = tf.matmul(R_inv, sigma_new)
+
+        t1 = tf.reduce_sum(tf.multiply(tf.tensordot(nu, Lambda_inv, 1), nu), axis=1)
+        t1 = tf.stack([t1] * num_inducing)
+        t1 = t1 + tf.transpose(t1)
+
+        z = tf.transpose(tf.matmul(Lambda_inv, nu, transpose_b=True))
+        z = tf.stack([z] * num_inducing)
+        z += tf.transpose(z, [1, 0, 2])
+        t1 -= tf.reduce_sum(tf.multiply(tf.tensordot(z, R_sigma, 1), z), axis=2)
+
+        n = 2 * (tf.log(self.kern.variance)) - t1 / 2  # log(\alpha ^ 2) = 2 * log(\alpha)
+        Q = tf.exp(n) / tf.sqrt(self._det(R))
+
+        var = tf.matmul(tf.tensordot(betas, Q, [0, 0]), betas) - tf.tensordot(means, means, 0)
+        var += (self.kern.variance - tf.linalg.trace(tf.matmul(K_inv, Q))) \
+               * tf.eye(self.y_dim, dtype=settings.float_type)
+
+        return means, var
+
+    @autoflow((settings.float_type, [None]), (settings.float_type, [None, None]))
+    def moment_matching(self, mu, sigma):
+        return self._build_moment_matching(mu, sigma)
 
 
 class GPRFITC(GPModel, SGPRUpperMixin):
